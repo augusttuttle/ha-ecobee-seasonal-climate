@@ -1,0 +1,657 @@
+# Seasonal thermostat control for the two ecobees (HomeKit-local):
+#   climate.main_floor, climate.upstairs
+#
+# HA owns the schedule. The ecobee's own schedule should be a single "Home"
+# comfort setting with Hold Action = "until I change it", or it will undo these.
+#
+# Master switch: input_boolean.climate_schedule_enabled. Off = HA never touches
+# the thermostats. script.climate_restore_baseline puts back the 2026-10-19 state.
+
+input_boolean:
+  climate_schedule_enabled:
+    name: Thermostat schedule enabled
+    icon: mdi:thermostat-auto
+  climate_season_auto:
+    name: Pick thermostat season from forecast
+    icon: mdi:weather-partly-cloudy
+
+input_select:
+  climate_season:
+    name: Thermostat season
+    # First option is the default for a new helper, so keep Shoulder first.
+    options:
+      - Shoulder
+      - Heat
+      - Cool
+    icon: mdi:sun-snowflake-variant
+
+# No `initial:` on purpose, so values edited in the UI survive a restart.
+# script.climate_reset_settings_to_defaults sets them all.
+input_number:
+  climate_heat_comfort:
+    name: Heat season - comfort (wake/evening/sleep)
+    min: 62
+    max: 76
+    step: 1
+    unit_of_measurement: "°F"
+    icon: mdi:fire
+  climate_heat_day:
+    name: Heat season - weekday daytime
+    min: 62
+    max: 76
+    step: 1
+    unit_of_measurement: "°F"
+    icon: mdi:fire
+  climate_cool_comfort:
+    name: Cool season - comfort (wake/evening/sleep)
+    min: 68
+    max: 80
+    step: 1
+    unit_of_measurement: "°F"
+    icon: mdi:snowflake
+  climate_cool_day:
+    name: Cool season - weekday daytime
+    min: 68
+    max: 80
+    step: 1
+    unit_of_measurement: "°F"
+    icon: mdi:snowflake
+  climate_shoulder_heat_comfort:
+    name: Shoulder - heat below (comfort)
+    min: 62
+    max: 76
+    step: 1
+    unit_of_measurement: "°F"
+    icon: mdi:sun-snowflake-variant
+  climate_shoulder_heat_day:
+    name: Shoulder - heat below (weekday daytime)
+    min: 62
+    max: 76
+    step: 1
+    unit_of_measurement: "°F"
+    icon: mdi:sun-snowflake-variant
+  climate_shoulder_cool:
+    name: Shoulder - cool above
+    min: 68
+    max: 82
+    step: 1
+    unit_of_measurement: "°F"
+    icon: mdi:sun-snowflake-variant
+  climate_override_offset_main_floor:
+    name: Main floor adjust by
+    min: -6
+    max: 6
+    step: 1
+    unit_of_measurement: "°F"
+    icon: mdi:thermometer-plus
+  climate_override_offset_upstairs:
+    name: Upstairs adjust by
+    min: -6
+    max: 6
+    step: 1
+    unit_of_measurement: "°F"
+    icon: mdi:thermometer-plus
+  climate_override_hours_main_floor:
+    name: Main floor adjust for
+    min: 0.5
+    max: 12
+    step: 0.5
+    unit_of_measurement: h
+    icon: mdi:timer-outline
+  climate_override_hours_upstairs:
+    name: Upstairs adjust for
+    min: 0.5
+    max: 12
+    step: 0.5
+    unit_of_measurement: h
+    icon: mdi:timer-outline
+  climate_min_delta:
+    name: Heat/cool minimum gap (match ecobee setting)
+    min: 2
+    max: 10
+    step: 1
+    unit_of_measurement: "°F"
+    icon: mdi:arrow-expand-vertical
+  climate_heat_below:
+    name: Switch to Heat when 3-day avg high below
+    min: 45
+    max: 75
+    step: 1
+    unit_of_measurement: "°F"
+    icon: mdi:thermometer-chevron-down
+  climate_heat_exit_above:
+    name: Leave Heat when 3-day avg high above
+    min: 50
+    max: 80
+    step: 1
+    unit_of_measurement: "°F"
+    icon: mdi:thermometer-chevron-up
+  climate_cool_above:
+    name: Switch to Cool when 3-day avg high above
+    min: 70
+    max: 95
+    step: 1
+    unit_of_measurement: "°F"
+    icon: mdi:thermometer-chevron-up
+  climate_cool_exit_below:
+    name: Leave Cool when 3-day avg high below
+    min: 65
+    max: 90
+    step: 1
+    unit_of_measurement: "°F"
+    icon: mdi:thermometer-chevron-down
+
+# Temporary adjust: shift a floor's targets by an offset until its timer ends.
+# Both heat and cool move together, so the min-delta gap is kept.
+timer:
+  climate_override_main_floor:
+    name: Main floor temporary adjust
+    icon: mdi:timer-sand
+    restore: true
+  climate_override_upstairs:
+    name: Upstairs temporary adjust
+    icon: mdi:timer-sand
+    restore: true
+
+# Weekday daytime setback windows. Weekends stay at comfort all day.
+# Upstairs ends at noon so it is back at comfort for the afternoon.
+schedule:
+  climate_main_floor_day:
+    name: Main floor weekday daytime
+    monday: &main_day
+      - from: "08:30:00"
+        to: "16:00:00"
+    tuesday: *main_day
+    wednesday: *main_day
+    thursday: *main_day
+    friday: *main_day
+  climate_upstairs_day:
+    name: Upstairs weekday daytime
+    monday: &up_day
+      - from: "08:30:00"
+        to: "12:00:00"
+    tuesday: *up_day
+    wednesday: *up_day
+    thursday: *up_day
+    friday: *up_day
+
+template:
+  - triggers:
+      - trigger: time_pattern
+        minutes: 0
+      - trigger: homeassistant
+        event: start
+    actions:
+      - action: weather.get_forecasts
+        target:
+          entity_id: weather.forecast_home
+        data:
+          type: daily
+        response_variable: fc
+    sensor:
+      - name: Climate forecast avg high
+        unique_id: climate_forecast_avg_high
+        unit_of_measurement: "°F"
+        device_class: temperature
+        state_class: measurement
+        state: >-
+          {% set highs = fc['weather.forecast_home'].forecast[:3] | map(attribute='temperature') | list %}
+          {{ (highs | sum / highs | count) | round(1) if highs else none }}
+        attributes:
+          highs: >-
+            {{ fc['weather.forecast_home'].forecast[:3] | map(attribute='temperature') | list }}
+          lows: >-
+            {{ fc['weather.forecast_home'].forecast[:3] | map(attribute='templow') | list }}
+
+  # hvac_action is an attribute; automations and history need it as a state.
+  - sensor:
+      - name: Main floor adjust preview
+        unique_id: climate_adjust_preview_main_floor
+        icon: mdi:thermometer
+        state: "{{ 'active' if is_state('timer.climate_override_main_floor', 'active') else 'idle' }}"
+        attributes:
+          title: >-
+            {% set c = 'climate.main_floor' %}
+            {% set active = is_state('timer.climate_override_main_floor', 'active') %}
+            {% set o = states('input_number.climate_override_offset_main_floor') | float(0) %}
+            {% set shift = o if active else 0 %}
+            {% macro t(d) -%}
+              {%- if is_state(c, 'heat_cool') -%}
+                {{ (state_attr(c, 'target_temp_low') | float(0) - d) | round | int }}–{{ (state_attr(c, 'target_temp_high') | float(0) - d) | round | int }}
+              {%- elif states(c) in ['heat', 'cool'] -%}
+                {{ (state_attr(c, 'temperature') | float(0) - d) | round | int }}
+              {%- else -%}{{ states(c) }}{%- endif -%}
+            {%- endmacro %}
+            {% if active %}Main floor · {{ t(0) }}°F ({{ '%+d' | format(o | int) }})
+            {% elif o != 0 %}Main floor · {{ t(0) }} → {{ t(-o) }}°F
+            {% else %}Main floor · {{ t(0) }}°F{% endif %}
+          detail: >-
+            {% set c = 'climate.main_floor' %}
+            {% set active = is_state('timer.climate_override_main_floor', 'active') %}
+            {% set o = states('input_number.climate_override_offset_main_floor') | float(0) %}
+            {% set h = states('input_number.climate_override_hours_main_floor') | float(2) %}
+            {% set dur = (h * 60) | int ~ ' min' if h < 1 else (h | round(1) | string).replace('.0', '') ~ ' h' %}
+            {% if active %}
+              {% set lo = state_attr(c, 'target_temp_low') | float(0) - o %}
+              {% set hi = state_attr(c, 'target_temp_high') | float(0) - o %}
+              {% set back = (lo | round | int ~ '–' ~ hi | round | int) if is_state(c, 'heat_cool') else ((state_attr(c, 'temperature') | float(0) - o) | round | int) %}
+              Until {{ as_timestamp(state_attr('timer.climate_override_main_floor', 'finishes_at')) | timestamp_custom('%-I:%M %p') }}, then back to {{ back }}. Tap to end now.
+            {% elif not is_state('input_boolean.climate_schedule_enabled', 'on') %}
+              Schedule is off, so adjusting does nothing.
+            {% elif o == 0 %}
+              Set an amount below, then tap here.
+            {% else %}
+              Tap to {{ 'raise' if o > 0 else 'lower' }} by {{ o | abs | int }}°F for {{ dur }}.
+            {% endif %}
+          card_icon: >-
+            {% set o = states('input_number.climate_override_offset_main_floor') | float(0) %}
+            {% if is_state('timer.climate_override_main_floor', 'active') %}mdi:timer-sand
+            {% elif o > 0 %}mdi:thermometer-chevron-up
+            {% elif o < 0 %}mdi:thermometer-chevron-down
+            {% else %}mdi:thermometer{% endif %}
+          card_color: >-
+            {% set o = states('input_number.climate_override_offset_main_floor') | float(0) %}
+            {% if o > 0 %}{{ 'deep-orange' if is_state('timer.climate_override_main_floor', 'active') else 'orange' }}
+            {% elif o < 0 %}{{ 'indigo' if is_state('timer.climate_override_main_floor', 'active') else 'blue' }}
+            {% else %}disabled{% endif %}
+      - name: Upstairs adjust preview
+        unique_id: climate_adjust_preview_upstairs
+        icon: mdi:thermometer
+        state: "{{ 'active' if is_state('timer.climate_override_upstairs', 'active') else 'idle' }}"
+        attributes:
+          title: >-
+            {% set c = 'climate.upstairs' %}
+            {% set active = is_state('timer.climate_override_upstairs', 'active') %}
+            {% set o = states('input_number.climate_override_offset_upstairs') | float(0) %}
+            {% set shift = o if active else 0 %}
+            {% macro t(d) -%}
+              {%- if is_state(c, 'heat_cool') -%}
+                {{ (state_attr(c, 'target_temp_low') | float(0) - d) | round | int }}–{{ (state_attr(c, 'target_temp_high') | float(0) - d) | round | int }}
+              {%- elif states(c) in ['heat', 'cool'] -%}
+                {{ (state_attr(c, 'temperature') | float(0) - d) | round | int }}
+              {%- else -%}{{ states(c) }}{%- endif -%}
+            {%- endmacro %}
+            {% if active %}Upstairs · {{ t(0) }}°F ({{ '%+d' | format(o | int) }})
+            {% elif o != 0 %}Upstairs · {{ t(0) }} → {{ t(-o) }}°F
+            {% else %}Upstairs · {{ t(0) }}°F{% endif %}
+          detail: >-
+            {% set c = 'climate.upstairs' %}
+            {% set active = is_state('timer.climate_override_upstairs', 'active') %}
+            {% set o = states('input_number.climate_override_offset_upstairs') | float(0) %}
+            {% set h = states('input_number.climate_override_hours_upstairs') | float(2) %}
+            {% set dur = (h * 60) | int ~ ' min' if h < 1 else (h | round(1) | string).replace('.0', '') ~ ' h' %}
+            {% if active %}
+              {% set lo = state_attr(c, 'target_temp_low') | float(0) - o %}
+              {% set hi = state_attr(c, 'target_temp_high') | float(0) - o %}
+              {% set back = (lo | round | int ~ '–' ~ hi | round | int) if is_state(c, 'heat_cool') else ((state_attr(c, 'temperature') | float(0) - o) | round | int) %}
+              Until {{ as_timestamp(state_attr('timer.climate_override_upstairs', 'finishes_at')) | timestamp_custom('%-I:%M %p') }}, then back to {{ back }}. Tap to end now.
+            {% elif not is_state('input_boolean.climate_schedule_enabled', 'on') %}
+              Schedule is off, so adjusting does nothing.
+            {% elif o == 0 %}
+              Set an amount below, then tap here.
+            {% else %}
+              Tap to {{ 'raise' if o > 0 else 'lower' }} by {{ o | abs | int }}°F for {{ dur }}.
+            {% endif %}
+          card_icon: >-
+            {% set o = states('input_number.climate_override_offset_upstairs') | float(0) %}
+            {% if is_state('timer.climate_override_upstairs', 'active') %}mdi:timer-sand
+            {% elif o > 0 %}mdi:thermometer-chevron-up
+            {% elif o < 0 %}mdi:thermometer-chevron-down
+            {% else %}mdi:thermometer{% endif %}
+          card_color: >-
+            {% set o = states('input_number.climate_override_offset_upstairs') | float(0) %}
+            {% if o > 0 %}{{ 'deep-orange' if is_state('timer.climate_override_upstairs', 'active') else 'orange' }}
+            {% elif o < 0 %}{{ 'indigo' if is_state('timer.climate_override_upstairs', 'active') else 'blue' }}
+            {% else %}disabled{% endif %}
+      - name: Main floor HVAC action
+        unique_id: climate_main_floor_hvac_action
+        state: "{{ state_attr('climate.main_floor', 'hvac_action') or 'unknown' }}"
+      - name: Upstairs HVAC action
+        unique_id: climate_upstairs_hvac_action
+        state: "{{ state_attr('climate.upstairs', 'hvac_action') or 'unknown' }}"
+
+script:
+  climate_restore_baseline:
+    alias: "Thermostat: restore 2026-10-19 baseline"
+    icon: mdi:backup-restore
+    sequence:
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.climate_schedule_enabled
+      - action: timer.cancel
+        target:
+          entity_id:
+            - timer.climate_override_main_floor
+            - timer.climate_override_upstairs
+      - action: climate.set_temperature
+        target:
+          entity_id:
+            - climate.main_floor
+            - climate.upstairs
+        data:
+          hvac_mode: heat_cool
+          target_temp_low: 67
+          target_temp_high: 72
+      - action: climate.set_fan_mode
+        target:
+          entity_id:
+            - climate.main_floor
+            - climate.upstairs
+        data:
+          fan_mode: auto
+      - action: select.select_option
+        target:
+          entity_id:
+            - select.main_floor_current_mode
+            - select.upstairs_current_mode
+        data:
+          option: home
+
+  climate_override_start:
+    alias: "Thermostat: start temporary adjust"
+    icon: mdi:thermometer-plus
+    mode: queued
+    fields:
+      zone:
+        description: main_floor, upstairs or both
+        example: upstairs
+      offset:
+        description: Degrees F to add (negative lowers). Default is the floor's "adjust by" setting.
+      hours:
+        description: How long. Default is the floor's "adjust for" setting.
+    sequence:
+      - repeat:
+          for_each: "{{ ['main_floor', 'upstairs'] if zone == 'both' else [zone] }}"
+          sequence:
+            - if: "{{ offset is defined }}"
+              then:
+                - action: input_number.set_value
+                  target:
+                    entity_id: "input_number.climate_override_offset_{{ repeat.item }}"
+                  data:
+                    value: "{{ offset | float }}"
+            - action: timer.start
+              target:
+                entity_id: "timer.climate_override_{{ repeat.item }}"
+              data:
+                duration: >-
+                  {{ ((hours if hours is defined else states('input_number.climate_override_hours_' ~ repeat.item)) | float * 3600) | int }}
+
+  # One tap target for the dashboard card: start if idle, end early if running.
+  climate_override_toggle:
+    alias: "Thermostat: start or end temporary adjust"
+    icon: mdi:thermometer-plus
+    mode: queued
+    fields:
+      zone:
+        description: main_floor or upstairs
+        example: upstairs
+    sequence:
+      - if: "{{ is_state('timer.climate_override_' ~ zone, 'active') }}"
+        then:
+          - action: timer.cancel
+            target:
+              entity_id: "timer.climate_override_{{ zone }}"
+        else:
+          - if: "{{ states('input_number.climate_override_offset_' ~ zone) | float(0) != 0 }}"
+            then:
+              - action: script.climate_override_start
+                data:
+                  zone: "{{ zone }}"
+
+  climate_override_cancel:
+    alias: "Thermostat: cancel temporary adjust"
+    icon: mdi:timer-off-outline
+    fields:
+      zone:
+        description: main_floor, upstairs or both
+        example: both
+    sequence:
+      - action: timer.cancel
+        target:
+          entity_id: >-
+            {{ ['timer.climate_override_main_floor', 'timer.climate_override_upstairs'] if zone | default('both') == 'both'
+               else ['timer.climate_override_' ~ zone] }}
+
+  climate_reset_settings_to_defaults:
+    alias: "Thermostat: reset settings to defaults"
+    icon: mdi:restore
+    sequence:
+      - action: input_number.set_value
+        target: { entity_id: input_number.climate_heat_comfort }
+        data: { value: 72 }
+      - action: input_number.set_value
+        target: { entity_id: input_number.climate_heat_day }
+        data: { value: 72 }
+      - action: input_number.set_value
+        target: { entity_id: input_number.climate_cool_comfort }
+        data: { value: 72 }
+      - action: input_number.set_value
+        target: { entity_id: input_number.climate_cool_day }
+        data: { value: 72 }
+      - action: input_number.set_value
+        target: { entity_id: input_number.climate_shoulder_heat_comfort }
+        data: { value: 72 }
+      - action: input_number.set_value
+        target: { entity_id: input_number.climate_shoulder_heat_day }
+        data: { value: 72 }
+      - action: input_number.set_value
+        target: { entity_id: input_number.climate_shoulder_cool }
+        data: { value: 75 }
+      - action: input_number.set_value
+        target: { entity_id: input_number.climate_min_delta }
+        data: { value: 3 }
+      - action: input_number.set_value
+        target: { entity_id: input_number.climate_heat_below }
+        data: { value: 62 }
+      - action: input_number.set_value
+        target: { entity_id: input_number.climate_heat_exit_above }
+        data: { value: 68 }
+      - action: input_number.set_value
+        target: { entity_id: input_number.climate_cool_above }
+        data: { value: 80 }
+      - action: input_number.set_value
+        target: { entity_id: input_number.climate_cool_exit_below }
+        data: { value: 74 }
+      - action: input_number.set_value
+        target:
+          entity_id:
+            - input_number.climate_override_offset_main_floor
+            - input_number.climate_override_offset_upstairs
+        data: { value: 0 }
+      - action: input_number.set_value
+        target:
+          entity_id:
+            - input_number.climate_override_hours_main_floor
+            - input_number.climate_override_hours_upstairs
+        data: { value: 2 }
+      - if: "{{ states('script.climate_monitoring_defaults') != 'unknown' }}"
+        then:
+          - action: script.climate_monitoring_defaults
+
+automation:
+  # Thresholds differ by direction (hysteresis) so one warm day can't flip it.
+  - id: climate_season_from_forecast
+    alias: "Thermostat: pick season from forecast"
+    mode: single
+    triggers:
+      - trigger: time
+        at: "05:05:00"
+      - trigger: state
+        entity_id: input_boolean.climate_season_auto
+        to: "on"
+    conditions:
+      - condition: state
+        entity_id: input_boolean.climate_season_auto
+        state: "on"
+      - condition: template
+        value_template: "{{ states('sensor.climate_forecast_avg_high') | is_number }}"
+    actions:
+      - variables:
+          avg: "{{ states('sensor.climate_forecast_avg_high') | float }}"
+          current: "{{ states('input_select.climate_season') }}"
+          target: >-
+            {% if current == 'Heat' %}
+              {{ 'Shoulder' if avg > states('input_number.climate_heat_exit_above') | float else 'Heat' }}
+            {% elif current == 'Cool' %}
+              {{ 'Shoulder' if avg < states('input_number.climate_cool_exit_below') | float else 'Cool' }}
+            {% elif avg < states('input_number.climate_heat_below') | float %}
+              Heat
+            {% elif avg > states('input_number.climate_cool_above') | float %}
+              Cool
+            {% else %}
+              Shoulder
+            {% endif %}
+      - if: "{{ target != current }}"
+        then:
+          - action: input_select.select_option
+            target:
+              entity_id: input_select.climate_season
+            data:
+              option: "{{ target }}"
+          - action: notify.climate_alerts
+            data:
+              title: "Thermostats: {{ current }} → {{ target }}"
+              message: >-
+                3-day forecast highs {{ state_attr('sensor.climate_forecast_avg_high', 'highs') }}
+                (avg {{ avg }}°F).
+
+  - id: climate_apply_setpoints
+    alias: "Thermostat: apply season and time-of-day setpoints"
+    mode: queued
+    max: 3
+    triggers:
+      - trigger: state
+        entity_id:
+          - input_select.climate_season
+          - schedule.climate_main_floor_day
+          - schedule.climate_upstairs_day
+          - input_number.climate_heat_comfort
+          - input_number.climate_heat_day
+          - input_number.climate_cool_comfort
+          - input_number.climate_cool_day
+          - input_number.climate_shoulder_heat_comfort
+          - input_number.climate_shoulder_heat_day
+          - input_number.climate_shoulder_cool
+          - input_number.climate_min_delta
+          - timer.climate_override_main_floor
+          - timer.climate_override_upstairs
+          - input_number.climate_override_offset_main_floor
+          - input_number.climate_override_offset_upstairs
+      - trigger: state
+        entity_id: input_boolean.climate_schedule_enabled
+        to: "on"
+      - trigger: state
+        entity_id:
+          - climate.main_floor
+          - climate.upstairs
+        from: unavailable
+      - trigger: homeassistant
+        event: start
+    conditions:
+      - condition: state
+        entity_id: input_boolean.climate_schedule_enabled
+        state: "on"
+    actions:
+      - delay: "00:00:02"
+      - repeat:
+          for_each:
+            - climate: climate.main_floor
+              day: schedule.climate_main_floor_day
+              zone: main_floor
+            - climate: climate.upstairs
+              day: schedule.climate_upstairs_day
+              zone: upstairs
+          sequence:
+            - variables:
+                season: "{{ states('input_select.climate_season') }}"
+                is_day: "{{ is_state(repeat.item.day, 'on') }}"
+                adj: >-
+                  {{ states('input_number.climate_override_offset_' ~ repeat.item.zone) | float(0)
+                     if is_state('timer.climate_override_' ~ repeat.item.zone, 'active') else 0 }}
+                heat_base: >-
+                  {% set p = 'input_number.climate_' %}
+                  {% if season == 'Heat' %}{{ states(p ~ ('heat_day' if is_day else 'heat_comfort')) | float }}
+                  {% else %}{{ states(p ~ ('shoulder_heat_day' if is_day else 'shoulder_heat_comfort')) | float }}{% endif %}
+                cool_base: >-
+                  {% set p = 'input_number.climate_' %}
+                  {% if season == 'Cool' %}{{ states(p ~ ('cool_day' if is_day else 'cool_comfort')) | float }}
+                  {% else %}{{ [states(p ~ 'shoulder_cool') | float, heat_base | float + states(p ~ 'min_delta') | float] | max }}{% endif %}
+                heat: "{{ heat_base | float + adj | float }}"
+                cool: "{{ cool_base | float + adj | float }}"
+                cur_mode: "{{ states(repeat.item.climate) }}"
+                cur_temp: "{{ state_attr(repeat.item.climate, 'temperature') | float(0) }}"
+                cur_low: "{{ state_attr(repeat.item.climate, 'target_temp_low') | float(0) }}"
+                cur_high: "{{ state_attr(repeat.item.climate, 'target_temp_high') | float(0) }}"
+            - choose:
+                - conditions: "{{ season == 'Heat' }}"
+                  sequence:
+                    - if: "{{ cur_mode != 'heat' or cur_temp != heat | float }}"
+                      then:
+                        - action: climate.set_temperature
+                          target:
+                            entity_id: "{{ repeat.item.climate }}"
+                          data:
+                            hvac_mode: heat
+                            temperature: "{{ heat | float }}"
+                - conditions: "{{ season == 'Cool' }}"
+                  sequence:
+                    - if: "{{ cur_mode != 'cool' or cur_temp != cool | float }}"
+                      then:
+                        - action: climate.set_temperature
+                          target:
+                            entity_id: "{{ repeat.item.climate }}"
+                          data:
+                            hvac_mode: cool
+                            temperature: "{{ cool | float }}"
+              default:
+                - if: >-
+                    {{ cur_mode != 'heat_cool' or cur_low != heat | float or cur_high != cool | float }}
+                  then:
+                    # The ecobee applies low before high and clamps low to stay
+                    # min-delta below the OLD high. Widen first so neither collides.
+                    - if: "{{ cur_mode == 'heat_cool' and (heat | float > cur_low or cool | float < cur_high) }}"
+                      then:
+                        - action: climate.set_temperature
+                          target:
+                            entity_id: "{{ repeat.item.climate }}"
+                          data:
+                            hvac_mode: heat_cool
+                            target_temp_low: "{{ [heat | float, cur_low] | min }}"
+                            target_temp_high: "{{ [cool | float, cur_high] | max }}"
+                        - delay: "00:00:05"
+                    - action: climate.set_temperature
+                      target:
+                        entity_id: "{{ repeat.item.climate }}"
+                      data:
+                        hvac_mode: heat_cool
+                        target_temp_low: "{{ heat | float }}"
+                        target_temp_high: "{{ cool | float }}"
+                    # Re-send once if HomeKit reports something else, then log it.
+                    # Blind spot: an ecobee that widens a too-narrow range to its own
+                    # min delta (72/75 -> 71/76) can keep REPORTING 72/75, so this
+                    # never fires for that. climate_min_delta must match the ecobee.
+                    - delay: "00:00:20"
+                    - if: >-
+                        {{ state_attr(repeat.item.climate, 'target_temp_low') | float(0) != heat | float
+                           or state_attr(repeat.item.climate, 'target_temp_high') | float(0) != cool | float }}
+                      then:
+                        - action: climate.set_temperature
+                          target:
+                            entity_id: "{{ repeat.item.climate }}"
+                          data:
+                            hvac_mode: heat_cool
+                            target_temp_low: "{{ heat | float }}"
+                            target_temp_high: "{{ cool | float }}"
+                        - delay: "00:00:20"
+                        - if: >-
+                            {{ state_attr(repeat.item.climate, 'target_temp_low') | float(0) != heat | float
+                               or state_attr(repeat.item.climate, 'target_temp_high') | float(0) != cool | float }}
+                          then:
+                            - action: system_log.write
+                              data:
+                                level: warning
+                                logger: climate_seasonal
+                                message: >-
+                                  {{ repeat.item.climate }} wanted {{ heat }}/{{ cool }} but is at
+                                  {{ state_attr(repeat.item.climate, 'target_temp_low') }}/{{ state_attr(repeat.item.climate, 'target_temp_high') }}

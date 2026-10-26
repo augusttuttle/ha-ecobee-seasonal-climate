@@ -1,0 +1,572 @@
+# Monitoring for the HVAC: fault alarms, durable runtime/degree-day history,
+# and filter/service reminders. Independent of climate_seasonal.yaml; delete
+# this file and reload to remove it.
+#
+# Plant: ONE gas furnace (+ AC) with dampers, two zones. Each ecobee's
+# hvac_action is that zone's call; the furnace runs while either zone calls.
+#
+# Master switch: input_boolean.climate_alarms_enabled (reminders and history
+# keep running when it's off; only the alarms stop).
+
+# The 0/1 signals have no unit, so integration can't derive "h" on its own.
+homeassistant:
+  customize:
+    sensor.furnace_heat_hours_total: &hours { unit_of_measurement: h }
+    sensor.ac_cool_hours_total: *hours
+    sensor.blower_hours_total: *hours
+    sensor.main_floor_heat_call_hours_total: *hours
+    sensor.upstairs_heat_call_hours_total: *hours
+    sensor.main_floor_cool_call_hours_total: *hours
+    sensor.upstairs_cool_call_hours_total: *hours
+    sensor.furnace_heating_today: *hours
+    sensor.ac_cooling_today: *hours
+    sensor.blower_today: *hours
+    sensor.main_floor_heat_call_today: *hours
+    sensor.upstairs_heat_call_today: *hours
+    sensor.main_floor_cool_call_today: *hours
+    sensor.upstairs_cool_call_today: *hours
+
+input_boolean:
+  climate_alarms_enabled:
+    name: HVAC alarms enabled
+    icon: mdi:alarm-light-outline
+
+input_number:
+  climate_fault_minutes:
+    name: Alarm if calling this long with no progress
+    min: 20
+    max: 120
+    step: 5
+    unit_of_measurement: min
+    icon: mdi:timer-alert-outline
+  climate_alarm_low:
+    name: Alarm if any floor below
+    min: 50
+    max: 68
+    step: 1
+    unit_of_measurement: "°F"
+    icon: mdi:snowflake-alert
+  climate_alarm_high:
+    name: Alarm if any floor above
+    min: 76
+    max: 95
+    step: 1
+    unit_of_measurement: "°F"
+    icon: mdi:fire-alert
+  climate_short_cycle_max:
+    name: Alarm if more equipment starts per hour than
+    min: 3
+    max: 12
+    step: 1
+    icon: mdi:sync-alert
+  climate_filter_max_hours:
+    name: Filter life (blower hours)
+    min: 50
+    max: 2000
+    step: 10
+    unit_of_measurement: h
+    icon: mdi:air-filter
+  climate_filter_max_days:
+    name: Filter life (days)
+    min: 14
+    max: 365
+    step: 1
+    unit_of_measurement: d
+    icon: mdi:air-filter
+  climate_filter_blower_hours_at_change:
+    name: Blower hours at last filter change
+    min: 0
+    max: 100000
+    step: 0.1
+    mode: box
+    unit_of_measurement: h
+    icon: mdi:air-filter
+
+input_datetime:
+  climate_filter_changed:
+    name: Filter last changed
+    has_date: true
+    has_time: false
+    icon: mdi:calendar-check
+
+template:
+  # 0/1 signals: integration (below) needs a number to accumulate.
+  - sensor:
+      - name: Furnace heating signal
+        unique_id: climate_furnace_heat_signal
+        state: >-
+          {{ 1 if 'heating' in [state_attr('climate.main_floor', 'hvac_action'),
+                                state_attr('climate.upstairs', 'hvac_action')] else 0 }}
+      - name: AC cooling signal
+        unique_id: climate_ac_cool_signal
+        state: >-
+          {{ 1 if 'cooling' in [state_attr('climate.main_floor', 'hvac_action'),
+                                state_attr('climate.upstairs', 'hvac_action')] else 0 }}
+      # HomeKit doesn't report fan-only running; fan_mode "on" means continuous.
+      - name: Blower signal
+        unique_id: climate_blower_signal
+        state: >-
+          {% set acts = [state_attr('climate.main_floor', 'hvac_action'), state_attr('climate.upstairs', 'hvac_action')] %}
+          {% set fans = [state_attr('climate.main_floor', 'fan_mode'), state_attr('climate.upstairs', 'fan_mode')] %}
+          {{ 1 if 'heating' in acts or 'cooling' in acts or 'on' in fans else 0 }}
+      - name: Main floor heat call signal
+        unique_id: climate_main_floor_heat_signal
+        state: "{{ 1 if is_state_attr('climate.main_floor', 'hvac_action', 'heating') else 0 }}"
+      - name: Upstairs heat call signal
+        unique_id: climate_upstairs_heat_signal
+        state: "{{ 1 if is_state_attr('climate.upstairs', 'hvac_action', 'heating') else 0 }}"
+      - name: Main floor cool call signal
+        unique_id: climate_main_floor_cool_signal
+        state: "{{ 1 if is_state_attr('climate.main_floor', 'hvac_action', 'cooling') else 0 }}"
+      - name: Upstairs cool call signal
+        unique_id: climate_upstairs_cool_signal
+        state: "{{ 1 if is_state_attr('climate.upstairs', 'hvac_action', 'cooling') else 0 }}"
+
+      - name: Outdoor temperature
+        unique_id: climate_outdoor_temperature
+        unit_of_measurement: "°F"
+        device_class: temperature
+        state_class: measurement
+        availability: "{{ state_attr('weather.forecast_home', 'temperature') | is_number }}"
+        state: "{{ state_attr('weather.forecast_home', 'temperature') }}"
+      # Base 65°F, the US convention for degree days.
+      - name: Heating degree rate
+        unique_id: climate_hdd_rate
+        unit_of_measurement: "°F"
+        state_class: measurement
+        availability: "{{ states('sensor.outdoor_temperature') | is_number }}"
+        state: "{{ [65 - states('sensor.outdoor_temperature') | float, 0] | max | round(1) }}"
+      - name: Cooling degree rate
+        unique_id: climate_cdd_rate
+        unit_of_measurement: "°F"
+        state_class: measurement
+        availability: "{{ states('sensor.outdoor_temperature') | is_number }}"
+        state: "{{ [states('sensor.outdoor_temperature') | float - 65, 0] | max | round(1) }}"
+
+      # The building's efficiency number: furnace hours per heating degree day.
+      # Under 3 HDD the ratio is mostly noise, so it reports nothing.
+      - name: Furnace hours per HDD yesterday
+        unique_id: climate_furnace_hours_per_hdd
+        unit_of_measurement: h/°Fd
+        state_class: measurement
+        availability: >-
+          {{ state_attr('sensor.furnace_heating_today', 'last_period') | is_number
+             and state_attr('sensor.heating_degree_days_today', 'last_period') | float(0) >= 3 }}
+        state: >-
+          {{ (state_attr('sensor.furnace_heating_today', 'last_period') | float
+              / state_attr('sensor.heating_degree_days_today', 'last_period') | float) | round(3) }}
+
+      - name: Filter blower hours used
+        unique_id: climate_filter_hours_used
+        unit_of_measurement: h
+        state_class: measurement
+        icon: mdi:air-filter
+        availability: "{{ states('sensor.blower_hours_total') | is_number }}"
+        state: >-
+          {{ [states('sensor.blower_hours_total') | float - states('input_number.climate_filter_blower_hours_at_change') | float(0), 0] | max | round(1) }}
+      - name: Filter days used
+        unique_id: climate_filter_days_used
+        unit_of_measurement: d
+        icon: mdi:calendar-clock
+        availability: "{{ states('input_datetime.climate_filter_changed') not in ['unknown', 'unavailable'] }}"
+        state: "{{ (now().date() - strptime(states('input_datetime.climate_filter_changed'), '%Y-%m-%d').date()).days }}"
+
+  - binary_sensor:
+      - name: Filter change due
+        unique_id: climate_filter_due
+        device_class: problem
+        icon: mdi:air-filter
+        state: >-
+          {{ states('sensor.filter_blower_hours_used') | float(0) >= states('input_number.climate_filter_max_hours') | float(300)
+             or states('sensor.filter_days_used') | float(0) >= states('input_number.climate_filter_max_days') | float(90) }}
+
+  # Temperature when each zone's current call began, for the no-progress alarm.
+  - triggers:
+      - trigger: state
+        entity_id: sensor.main_floor_hvac_action
+        to: [heating, cooling]
+    sensor:
+      - name: Main floor call start temperature
+        unique_id: climate_main_floor_call_start_temp
+        unit_of_measurement: "°F"
+        device_class: temperature
+        state: "{{ states('sensor.main_floor_current_temperature') }}"
+  - triggers:
+      - trigger: state
+        entity_id: sensor.upstairs_hvac_action
+        to: [heating, cooling]
+    sensor:
+      - name: Upstairs call start temperature
+        unique_id: climate_upstairs_call_start_temp
+        unit_of_measurement: "°F"
+        device_class: temperature
+        state: "{{ states('sensor.upstairs_current_temperature') }}"
+
+sensor:
+  # Running totals. These are total_increasing, so HA keeps their long-term
+  # statistics forever (the recorder purges raw history after 10 days).
+  - platform: integration
+    source: sensor.furnace_heating_signal
+    name: Furnace heat hours total
+    unique_id: climate_furnace_heat_hours_total
+    unit_time: h
+    method: left
+    round: 3
+    max_sub_interval:
+      minutes: 5
+  - platform: integration
+    source: sensor.ac_cooling_signal
+    name: AC cool hours total
+    unique_id: climate_ac_cool_hours_total
+    unit_time: h
+    method: left
+    round: 3
+    max_sub_interval:
+      minutes: 5
+  - platform: integration
+    source: sensor.blower_signal
+    name: Blower hours total
+    unique_id: climate_blower_hours_total
+    unit_time: h
+    method: left
+    round: 3
+    max_sub_interval:
+      minutes: 5
+  - platform: integration
+    source: sensor.main_floor_heat_call_signal
+    name: Main floor heat call hours total
+    unique_id: climate_main_floor_heat_hours_total
+    unit_time: h
+    method: left
+    round: 3
+    max_sub_interval:
+      minutes: 5
+  - platform: integration
+    source: sensor.upstairs_heat_call_signal
+    name: Upstairs heat call hours total
+    unique_id: climate_upstairs_heat_hours_total
+    unit_time: h
+    method: left
+    round: 3
+    max_sub_interval:
+      minutes: 5
+  - platform: integration
+    source: sensor.main_floor_cool_call_signal
+    name: Main floor cool call hours total
+    unique_id: climate_main_floor_cool_hours_total
+    unit_time: h
+    method: left
+    round: 3
+    max_sub_interval:
+      minutes: 5
+  - platform: integration
+    source: sensor.upstairs_cool_call_signal
+    name: Upstairs cool call hours total
+    unique_id: climate_upstairs_cool_hours_total
+    unit_time: h
+    method: left
+    round: 3
+    max_sub_interval:
+      minutes: 5
+  - platform: integration
+    source: sensor.heating_degree_rate
+    name: Heating degree days total
+    unique_id: climate_hdd_total
+    unit_time: d
+    method: trapezoidal
+    round: 3
+    max_sub_interval:
+      minutes: 15
+  - platform: integration
+    source: sensor.cooling_degree_rate
+    name: Cooling degree days total
+    unique_id: climate_cdd_total
+    unit_time: d
+    method: trapezoidal
+    round: 3
+    max_sub_interval:
+      minutes: 15
+
+  # Equipment starts in the last hour (short-cycling check).
+  - platform: history_stats
+    name: Furnace starts last hour
+    unique_id: climate_furnace_starts_last_hour
+    entity_id: sensor.furnace_heating_signal
+    state: "1"
+    type: count
+    start: "{{ now() - timedelta(hours=1) }}"
+    end: "{{ now() }}"
+  - platform: history_stats
+    name: AC starts last hour
+    unique_id: climate_ac_starts_last_hour
+    entity_id: sensor.ac_cooling_signal
+    state: "1"
+    type: count
+    start: "{{ now() - timedelta(hours=1) }}"
+    end: "{{ now() }}"
+
+utility_meter:
+  furnace_heating_today:
+    name: Furnace heating today
+    unique_id: climate_furnace_heating_today
+    source: sensor.furnace_heat_hours_total
+    cycle: daily
+  ac_cooling_today:
+    name: AC cooling today
+    unique_id: climate_ac_cooling_today
+    source: sensor.ac_cool_hours_total
+    cycle: daily
+  blower_today:
+    name: Blower today
+    unique_id: climate_blower_today
+    source: sensor.blower_hours_total
+    cycle: daily
+  main_floor_heat_call_today:
+    name: Main floor heat call today
+    unique_id: climate_main_floor_heat_call_today
+    source: sensor.main_floor_heat_call_hours_total
+    cycle: daily
+  upstairs_heat_call_today:
+    name: Upstairs heat call today
+    unique_id: climate_upstairs_heat_call_today
+    source: sensor.upstairs_heat_call_hours_total
+    cycle: daily
+  main_floor_cool_call_today:
+    name: Main floor cool call today
+    unique_id: climate_main_floor_cool_call_today
+    source: sensor.main_floor_cool_call_hours_total
+    cycle: daily
+  upstairs_cool_call_today:
+    name: Upstairs cool call today
+    unique_id: climate_upstairs_cool_call_today
+    source: sensor.upstairs_cool_call_hours_total
+    cycle: daily
+  heating_degree_days_today:
+    name: Heating degree days today
+    unique_id: climate_hdd_today
+    source: sensor.heating_degree_days_total
+    cycle: daily
+  cooling_degree_days_today:
+    name: Cooling degree days today
+    unique_id: climate_cdd_today
+    source: sensor.cooling_degree_days_total
+    cycle: daily
+
+script:
+  climate_alert:
+    alias: "HVAC: send alert"
+    mode: parallel
+    fields:
+      title:
+        description: Notification title
+      message:
+        description: Notification body
+    sequence:
+      - action: persistent_notification.create
+        data:
+          title: "{{ title }}"
+          message: "{{ message }}"
+      # notify.climate_alerts is a notify group of the phones to alert (see README).
+      - action: notify.climate_alerts
+        continue_on_error: true
+        data:
+          title: "{{ title }}"
+          message: "{{ message }}"
+          data:
+            push:
+              interruption-level: time-sensitive
+
+  climate_filter_changed:
+    alias: "HVAC: filter changed today"
+    icon: mdi:air-filter
+    sequence:
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.climate_filter_changed
+        data:
+          date: "{{ now().date() }}"
+      - action: input_number.set_value
+        target:
+          entity_id: input_number.climate_filter_blower_hours_at_change
+        data:
+          value: "{{ states('sensor.blower_hours_total') | float(0) }}"
+
+  climate_monitoring_defaults:
+    alias: "HVAC: reset alarm and filter settings to defaults"
+    icon: mdi:restore
+    sequence:
+      - action: input_number.set_value
+        target: { entity_id: input_number.climate_fault_minutes }
+        data: { value: 45 }
+      - action: input_number.set_value
+        target: { entity_id: input_number.climate_alarm_low }
+        data: { value: 62 }
+      - action: input_number.set_value
+        target: { entity_id: input_number.climate_alarm_high }
+        data: { value: 82 }
+      - action: input_number.set_value
+        target: { entity_id: input_number.climate_short_cycle_max }
+        data: { value: 6 }
+      - action: input_number.set_value
+        target: { entity_id: input_number.climate_filter_max_hours }
+        data: { value: 300 }
+      - action: input_number.set_value
+        target: { entity_id: input_number.climate_filter_max_days }
+        data: { value: 90 }
+
+automation:
+  # A zone that has called for heat (or cooling) this long without its
+  # temperature moving 0.5°F the right way: furnace lockout, flame sensor,
+  # stuck damper, frozen AC coil.
+  - id: climate_alarm_no_progress
+    alias: "HVAC alarm: calling but temperature not moving"
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: sensor.main_floor_hvac_action
+        to: [heating, cooling]
+        for:
+          minutes: "{{ states('input_number.climate_fault_minutes') | int(45) }}"
+        variables: { zone: main_floor, label: Main floor }
+      - trigger: state
+        entity_id: sensor.upstairs_hvac_action
+        to: [heating, cooling]
+        for:
+          minutes: "{{ states('input_number.climate_fault_minutes') | int(45) }}"
+        variables: { zone: upstairs, label: Upstairs }
+    conditions:
+      - condition: state
+        entity_id: input_boolean.climate_alarms_enabled
+        state: "on"
+      - condition: template
+        value_template: >-
+          {% set now_t = states('sensor.' ~ zone ~ '_current_temperature') | float(none) %}
+          {% set start_t = states('sensor.' ~ zone ~ '_call_start_temperature') | float(none) %}
+          {% if now_t is none or start_t is none %}false
+          {% elif trigger.to_state.state == 'heating' %}{{ now_t - start_t < 0.5 }}
+          {% else %}{{ start_t - now_t < 0.5 }}{% endif %}
+    actions:
+      - action: script.climate_alert
+        data:
+          title: "{{ label }}: {{ trigger.to_state.state }} isn't working"
+          message: >-
+            Calling for {{ 'heat' if trigger.to_state.state == 'heating' else 'cooling' }} for
+            {{ states('input_number.climate_fault_minutes') | int }} min, but the temperature went from
+            {{ states('sensor.' ~ zone ~ '_call_start_temperature') }} to
+            {{ states('sensor.' ~ zone ~ '_current_temperature') }}°F.
+            {{ 'Check the furnace for an error light or lockout.' if trigger.to_state.state == 'heating'
+               else 'Check the outdoor unit is running and the filter is clean.' }}
+
+  - id: climate_alarm_temperature_limits
+    alias: "HVAC alarm: floor too cold or too hot"
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id:
+          - sensor.main_floor_current_temperature
+          - sensor.upstairs_current_temperature
+        below: input_number.climate_alarm_low
+        for: "00:10:00"
+      - trigger: numeric_state
+        entity_id:
+          - sensor.main_floor_current_temperature
+          - sensor.upstairs_current_temperature
+        above: input_number.climate_alarm_high
+        for: "00:10:00"
+    conditions:
+      - condition: state
+        entity_id: input_boolean.climate_alarms_enabled
+        state: "on"
+    actions:
+      - action: script.climate_alert
+        data:
+          title: "{{ trigger.to_state.name | replace(' Current Temperature', '') }} is {{ trigger.to_state.state }}°F"
+          message: >-
+            Outside the {{ states('input_number.climate_alarm_low') | int }}–{{ states('input_number.climate_alarm_high') | int }}°F
+            alarm range for 10 min. Main floor {{ states('climate.main_floor') }} / {{ state_attr('climate.main_floor', 'hvac_action') }},
+            upstairs {{ states('climate.upstairs') }} / {{ state_attr('climate.upstairs', 'hvac_action') }}.
+
+  - id: climate_alarm_thermostat_offline
+    alias: "HVAC alarm: thermostat offline"
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id:
+          - climate.main_floor
+          - climate.upstairs
+        to: unavailable
+        for: "00:15:00"
+    conditions:
+      - condition: state
+        entity_id: input_boolean.climate_alarms_enabled
+        state: "on"
+    actions:
+      - action: script.climate_alert
+        data:
+          title: "{{ trigger.to_state.name }} thermostat offline"
+          message: >-
+            HA hasn't heard from it over HomeKit for 15 min, so the schedule and alarms
+            can't see that floor. The thermostat keeps running its last setting.
+
+  - id: climate_alarm_short_cycling
+    alias: "HVAC alarm: short cycling"
+    mode: single
+    max_exceeded: silent
+    triggers:
+      - trigger: numeric_state
+        entity_id:
+          - sensor.furnace_starts_last_hour
+          - sensor.ac_starts_last_hour
+        above: input_number.climate_short_cycle_max
+    conditions:
+      - condition: state
+        entity_id: input_boolean.climate_alarms_enabled
+        state: "on"
+    actions:
+      - action: script.climate_alert
+        data:
+          title: "{{ 'Furnace' if 'furnace' in trigger.entity_id else 'AC' }} is short cycling"
+          message: >-
+            {{ trigger.to_state.state }} starts in the last hour (alarm above
+            {{ states('input_number.climate_short_cycle_max') | int }}). Common causes: a clogged
+            filter, an overheating limit switch, or a thermostat with too small a cycle setting.
+      # One alert per hour at most.
+      - delay: "01:00:00"
+
+  - id: climate_reminder_filter
+    alias: "HVAC reminder: change filter"
+    mode: single
+    triggers:
+      - trigger: time
+        at: "09:00:00"
+    conditions:
+      - condition: state
+        entity_id: binary_sensor.filter_change_due
+        state: "on"
+    actions:
+      - action: script.climate_alert
+        data:
+          title: Time to change the furnace filter
+          message: >-
+            {{ states('sensor.filter_blower_hours_used') }} blower hours and
+            {{ states('sensor.filter_days_used') }} days since the last change
+            (limit {{ states('input_number.climate_filter_max_hours') | int }} h or
+            {{ states('input_number.climate_filter_max_days') | int }} days).
+            Tap "Filter changed" on the Climate tab afterwards.
+
+  - id: climate_reminder_service
+    alias: "HVAC reminder: annual furnace service"
+    mode: single
+    triggers:
+      - trigger: time
+        at: "10:00:00"
+    conditions:
+      - condition: template
+        value_template: "{{ now().month == 9 and now().day == 1 }}"
+    actions:
+      - action: script.climate_alert
+        data:
+          title: Book the furnace tune-up
+          message: >-
+            Heating season is coming. An annual service cleans the flame sensor and
+            burners and checks the heat exchanger and CO, before the first cold night.
