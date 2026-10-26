@@ -4,12 +4,14 @@
 # package starts OFF, so nothing touches the thermostats until you enable it.
 set -euo pipefail
 
+cd "$(dirname "$0")"
+[ -f .env ] && . ./.env   # untracked local settings (HA_HOST etc.)
+
 SSH=${SSH:-ssh}   # on Windows, set SSH to OpenSSH's ssh.exe if Git's ssh can't reach the key agent
 HOST=${HA_HOST:?set HA_HOST to the ssh target of the Docker host running Home Assistant, e.g. user@nas}
 HA=${HA_CONTAINER:-ix-home-assistant-home-assistant-1}
 PKG=ha/packages/climate_seasonal.yaml
 
-cd "$(dirname "$0")"
 if grep -q $'\r' "$PKG"; then echo "$PKG has CRLF line endings, aborting" >&2; exit 1; fi
 
 api() {  # api <method> <path> [json-body]

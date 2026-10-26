@@ -138,7 +138,9 @@ To put the dashboard back the way it was before this project, run
 The scripts run on a laptop and reach Home Assistant over ssh, on the Docker host
 that runs the HA container.
 
-- Set `HA_HOST` to the ssh target, for example `export HA_HOST=user@nas`.
+- Set `HA_HOST` to the ssh target, for example `HA_HOST=user@nas`. Each script reads
+  a `.env` file next to it if there is one, so local settings can live there. Git
+  ignores `.env`.
 - `HA_CONTAINER` is the container name. The default,
   `ix-home-assistant-home-assistant-1`, is what the TrueNAS SCALE app uses.
 - `SSH` defaults to `ssh`. On Windows, set it to
