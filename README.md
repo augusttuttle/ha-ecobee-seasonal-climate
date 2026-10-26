@@ -148,8 +148,9 @@ that runs the HA container.
 - Put a Home Assistant long-lived access token in `~/.ha_token` on the Docker host.
 - The dashboard script edits the dashboard named in `DASHBOARD` at the top of
   [apply_climate_dashboard.py](ha/dashboard/apply_climate_dashboard.py) (`home-hub`).
-- Alerts go to `notify.climate_alerts`. Define it as a notify group of your phones in
-  `configuration.yaml`:
+- Alerts go to `notify.climate_alerts`. Define it as a notify group of your phones,
+  either in `configuration.yaml` or in a package named `ha/packages/local_*.yaml`, which
+  git ignores and `deploy.sh` still copies. A new notify group needs one HA restart.
 
   ```yaml
   notify:
